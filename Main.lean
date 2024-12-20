@@ -58,6 +58,7 @@ structure Context where
   newConstants : Std.HashMap Name ConstantInfo
   verbose := false
   compare := false
+  pack : TypeChecker.Pack
 
 structure State where
   env : Environment
@@ -84,10 +85,10 @@ def throwKernelException (ex : KernelException) : M α := do
     Prod.fst <$> (Lean.Core.CoreM.toIO · ctx state) do Lean.throwKernelException ex
 
 def Lean.Declaration.name : Declaration → String
-  | .axiomDecl d => s!"axiomDecl {d.name}"
-  | .defnDecl d => s!"defnDecl {d.name}"
-  | .thmDecl d => s!"thmDecl {d.name}"
-  | .opaqueDecl d => s!"opaqueDecl {d.name}"
+  | .axiomDecl d => s!"axiomDecl {d.name} : {d.type}"
+  | .defnDecl d => s!"defnDecl {d.name} : {d.type} := {d.value}"
+  | .thmDecl d => s!"thmDecl {d.name} : {d.type}"
+  | .opaqueDecl d => s!"opaqueDecl {d.name} : {d.type}"
   | .quotDecl => s!"quotDecl"
   | .mutualDefnDecl d => s!"mutualDefnDecl {d.map (·.name)}"
   | .inductDecl _ _ d _ => s!"inductDecl {d.map (·.name)}"
@@ -96,9 +97,10 @@ def Lean.Declaration.name : Declaration → String
 def addDecl (d : Declaration) : M Unit := do
   if (← read).verbose then
     println! "adding {d.name}"
+  let pack := (← read).pack
   let t1 ← IO.monoMsNow
-  match (← get).env.addDecl' d true with
-  | .ok env =>
+  match (← get).env.addDecl' (pack := pack.get) d true () with
+  | EStateM.Result.ok env _ =>
     let t2 ← IO.monoMsNow
     if t2 - t1 > 1000 then
       if (← read).compare then
@@ -113,7 +115,7 @@ def addDecl (d : Declaration) : M Unit := do
       else
         println! "{(← get).env.mainModule}:{d.name}: lean4lean took {t2 - t1}"
     modify fun s => { s with env := env }
-  | .error ex =>
+  | .error ex _ =>
     throwKernelException ex
 
 deriving instance BEq for ConstantVal
@@ -230,7 +232,7 @@ def replay (ctx : Context) (env : Environment) (decl : Option Name := none) : IO
       checkPostponedRecursors
   return s.env
 
-unsafe def replayFromImports (module : Name) (verbose := false) (compare := false) : IO Unit := do
+unsafe def replayFromImports (module : Name) (verbose := false) (compare := false) (pack : TypeChecker.Pack): IO Unit := do
   let mFile ← findOLean module
   unless (← mFile.pathExists) do
     throw <| IO.userError s!"object file '{mFile}' of module {module} does not exist"
@@ -242,14 +244,14 @@ unsafe def replayFromImports (module : Name) (verbose := false) (compare := fals
   let mut newConstants := {}
   for name in mod.constNames, ci in mod.constants do
     newConstants := newConstants.insert name ci
-  let env' ← replay { newConstants, verbose, compare } env
+  let env' ← replay { newConstants, verbose, compare, pack} env
   env'.freeRegions
   region.free
 
 unsafe def replayFromFresh (module : Name)
-    (verbose := false) (compare := false) (decl : Option Name := none) : IO Unit := do
+    (verbose := false) (compare := false) (pack : TypeChecker.Pack) (decl : Option Name := none) : IO Unit := do
   Lean.withImportModules #[{module}] {} 0 fun env => do
-    let ctx := { newConstants := env.constants.map₁, verbose, compare }
+    let ctx := { newConstants := env.constants.map₁, verbose, compare, pack }
     discard <| replay ctx ((← mkEmptyEnvironment).setMainModule module) decl
 
 /-- Read the name of the main module from the `lake-manifest`. -/
@@ -285,6 +287,7 @@ unsafe def main (args : List String) : IO UInt32 := do
   let verbose := "-v" ∈ flags || "--verbose" ∈ flags
   let fresh : Bool := "--fresh" ∈ flags
   let compare : Bool := "--compare" ∈ flags
+  let pack : TypeChecker.Pack := if "--lazy" ∈ flags then .lazyNbE else .default
   let targets ← do
     match args with
     | [] => pure [← getCurrentModule]
@@ -310,11 +313,11 @@ unsafe def main (args : List String) : IO UInt32 := do
       throw <| IO.userError "--fresh flag is only valid when specifying a single module"
     for m in targetModules do
       if verbose then IO.println s!"replaying {m} with --fresh"
-      replayFromFresh m verbose compare
+      replayFromFresh m verbose compare pack
   else
     let mut tasks := #[]
     for m in targetModules do
-      tasks := tasks.push (m, ← IO.asTask (replayFromImports m verbose compare))
+      tasks := tasks.push (m, ← IO.asTask (replayFromImports m verbose compare pack))
     let mut err := false
     for (m, t) in tasks do
       if verbose then IO.println s!"replaying {m}"

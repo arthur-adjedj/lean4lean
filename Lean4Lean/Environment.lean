@@ -7,6 +7,8 @@ namespace Lean
 namespace Environment
 open TypeChecker
 
+variable [pack : MPack]
+
 open private add from Lean.Environment
 
 def checkConstantVal (env : Environment) (v : ConstantVal) (allowPrimitive := false) : M Unit := do
@@ -17,14 +19,14 @@ def checkConstantVal (env : Environment) (v : ConstantVal) (allowPrimitive := fa
   _ ← ensureSort sort v.type
 
 def addAxiom (env : Environment) (v : AxiomVal) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   if check then
     _ ← (checkConstantVal env v.toConstantVal).run env
       (safety := if v.isUnsafe then .unsafe else .safe)
   return add env (.axiomInfo v)
 
 def addDefinition (env : Environment) (v : DefinitionVal) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   if let .unsafe := v.safety then
     -- Meta definition can be recursive.
     -- So, we check the header, add, and then type check the body.
@@ -50,7 +52,7 @@ def addDefinition (env : Environment) (v : DefinitionVal) (check := true) :
     compileDecl env default (.defnDecl v)
 
 def addTheorem (env : Environment) (v : TheoremVal) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   if check then
     -- TODO(Leo): we must add support for handling tasks here
     M.run env (safety := .safe) (lctx := {}) do
@@ -64,7 +66,7 @@ def addTheorem (env : Environment) (v : TheoremVal) (check := true) :
   return add env (.thmInfo v)
 
 def addOpaque (env : Environment) (v : OpaqueVal) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   if check then
     M.run env (safety := .safe) (lctx := {}) do
       checkConstantVal env v.toConstantVal
@@ -74,7 +76,7 @@ def addOpaque (env : Environment) (v : OpaqueVal) (check := true) :
   return add env (.opaqueInfo v)
 
 def addMutual (env : Environment) (vs : List DefinitionVal) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   let v₀ :: _ := vs | throw <| .other "invalid empty mutual definition"
   if let .safe := v₀.safety then
     throw <| .other "invalid mutual definition, declaration is not tagged as unsafe/partial"
@@ -99,7 +101,7 @@ def addMutual (env : Environment) (vs : List DefinitionVal) (check := true) :
 
 /-- Type check given declaration and add it to the environment -/
 def addDecl' (env : Environment) (decl : @& Declaration) (check := true) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   match decl with
   | .axiomDecl v => addAxiom env v check
   | .defnDecl v => addDefinition env v check

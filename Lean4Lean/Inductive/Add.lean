@@ -32,7 +32,7 @@ structure Context where
   safety : DefinitionSafety
   allowPrimitive : Bool
 
-abbrev M := ReaderT Context <| Except KernelException
+abbrev M := ReaderT Context <| EIO KernelException
 
 instance : MonadLocalNameGenerator M where
   withFreshId f c := f c.ngen.curr { c with ngen := c.ngen.next }
@@ -48,6 +48,8 @@ instance : MonadLCtx M where
 
 @[inline] def withEnv (f : Environment → Environment) (x : M α) : M α :=
   withReader (fun c => { c with env := f c.env }) x
+
+variable [pack : MPack]
 
 def getType (fvar : Expr) : M Expr :=
   return ((← getLCtx).get! fvar.fvarId!).type
@@ -66,7 +68,7 @@ def checkInductiveTypes
       checkName (mkRecName indType.name)
       env.checkNoMVarNoFVar indType.name type
       _ ← check type lparams
-      let rec loop stats type i nindices fuel k : M α := match fuel with
+      let rec loop stats (type : Expr) i nindices fuel k : M α := match fuel with
       | 0 => throw .deepRecursion
       | fuel+1 => do
         if let .forallE name dom body bi := type then
@@ -710,9 +712,9 @@ def mkAuxRecNameMap (env' : Environment) (types : List InductiveType) :
     oldRecNames := oldRecNames.push oldRecName
   return (oldRecNames.toList, recMap)
 
-def Environment.addInductive (env : Environment) (lparams : List Name) (nparams : Nat)
+def Environment.addInductive [pack : TypeChecker.MPack] (env : Environment) (lparams : List Name) (nparams : Nat)
     (types : List InductiveType) (isUnsafe allowPrimitive : Bool) :
-    Except KernelException Environment := do
+    EIO KernelException Environment := do
   let res ← ElimNestedInductive.run nparams types env
     |>.run' { lvls := lparams.map .param, newTypes := types.toArray }
   let numNested := res.aux2nested.size

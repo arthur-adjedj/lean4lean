@@ -27,11 +27,23 @@ structure TypeChecker.Context where
 
 namespace TypeChecker
 
-abbrev M := ReaderT Context <| StateT State <| Except KernelException
+abbrev M := ReaderT Context <| StateRefT State (EIO KernelException)
 
 def M.run (env : Environment) (safety : DefinitionSafety := .safe) (lctx : LocalContext := {})
-    (x : M α) : Except KernelException α :=
+    (x : M α) : EIO KernelException α :=
   x { env, safety, lctx } |>.run' {}
+
+instance : MonadNameGenerator M where
+  getNGen := do
+    let st ← get
+    return st.ngen
+  setNGen ngen :=
+    modifyGet (fun f => ((),{f with ngen := ngen}))
+
+instance : MonadLift (Except ε) (EIO ε) where
+  monadLift := fun
+    | .ok e => pure e
+    | .error e => throw e
 
 instance : MonadEnv M where
   getEnv := return (← read).env
@@ -54,6 +66,8 @@ structure Methods where
   inferType (e : Expr) (inferOnly : Bool) : M Expr
 
 abbrev RecM := ReaderT Methods M
+
+instance : Nonempty (RecM α) := ⟨throw <| .other "foo"⟩
 
 inductive ReductionStatus where
   | continue (tn sn : Expr)
@@ -377,17 +391,15 @@ def unfoldDefinition (env : Environment) (e : Expr) : Option Expr := do
   else
     unfoldDefinitionCore env e
 
-def reduceNative (env : Environment) (e : Expr) : RecM (Option Expr) := do
+def reduceNative (e : Expr) : RecM (Option Expr) := do
   let .app f (.const c _) := e | return none
   if f == .const ``reduceBool [] then
-    dbg_trace "reduce_bool {c} : {env.contains c} : {Lean.IR.findEnvDecl env c}"
-    match unsafe Lean.Environment.evalConst  Bool env default c with
+    match unsafe Lean.Environment.evalConst  Bool (← getEnv) default c with
      | .error s => throw <| .other s!"Failed to reduce `ofReduceBool:\n {s}"
      | .ok true => return Expr.const ``true []
      | .ok false =>return Expr.const ``false []
   else if f == .const ``reduceNat [] then
-    dbg_trace "reduce_nat {c} : {env.contains c}"
-    match unsafe Lean.Environment.evalConst  Nat env default c with
+    match unsafe Lean.Environment.evalConst  Nat (← getEnv) default c with
      | .error s => throw <| .other s!"Failed to reduce `ofReduceNat:\n {s}"
      | .ok n => return mkNatLit n
   return none
@@ -443,7 +455,7 @@ def whnf' (e : Expr) : RecM Expr := do
   | fuel+1 => do
     let env ← getEnv
     let t ← whnfCore' t
-    if let some t ← reduceNative env t then return t
+    if let some t ← reduceNative t then return t
     if let some t ← reduceNat t then return t
     let some t := unfoldDefinition env t | return t
     loop t fuel
@@ -629,10 +641,9 @@ def lazyDeltaReduction (tn sn : Expr) : RecM ReductionStatus := loop tn sn 1000 
         return .bool (← isDefEqCore tn' sn)
       else if let some sn' ← reduceNat sn then
         return .bool (← isDefEqCore tn sn')
-    let env ← getEnv
-    if let some tn' ← reduceNative env tn then
+    if let some tn' ← reduceNative tn then
       return .bool (← isDefEqCore tn' sn)
-    else if let some sn' ← reduceNative env sn then
+    else if let some sn' ← reduceNative sn then
       return .bool (← isDefEqCore tn sn')
     match ← lazyDeltaReductionStep tn sn with
     | .continue tn sn => loop tn sn fuel
@@ -703,40 +714,398 @@ def isDefEqCore' (t s : Expr) : RecM Bool := do
 
 end Inner
 
+namespace LazyNbE
+
+@[inline] def liftMkBindingM (x : MetavarContext.MkBindingM α) : RecM α := do
+  match x { lctx := (← getLCtx), mainModule := (← getEnv).mainModule } { mctx := default, ngen := (← getNGen), nextMacroScope := default } with
+  | .ok e sNew => do
+    modify fun s => { s with ngen := sNew.ngen }
+    pure e
+  | .error (.revertFailure ..) sNew => do
+    modify fun s => { s with ngen := sNew.ngen }
+    throw <| .other "failed to create binder due to failure when reverting variable dependencies"
+
+  def whnf (e : Expr) : RecM Expr := fun m => m.whnf e
+
+  private def fvarsSizeLtMaxFVars (fvars : Array Expr) (maxFVars? : Option Nat) : Bool :=
+    match maxFVars? with
+    | some maxFVars => fvars.size < maxFVars
+    | none          => true
+
+  partial def forallTelescopeReducingAuxAux
+      (reducing          : Bool) (maxFVars? : Option Nat)
+      (type              : Expr)
+      (k                 : Array Expr → Expr → RecM α) (cleanupAnnotations : Bool) : RecM α := do
+    let rec process (lctx : LocalContext) (fvars : Array Expr) (j : Nat) (type : Expr) : RecM α := do
+      match type with
+      | .forallE n d b bi =>
+        if fvarsSizeLtMaxFVars fvars maxFVars? then
+          let d     := d.instantiateRevRange j fvars.size fvars
+          let d     := if cleanupAnnotations then d.cleanupAnnotations else d
+          let fvarId ← mkFreshFVarId
+          let lctx  := lctx.mkLocalDecl fvarId n d bi
+          let fvar  := mkFVar fvarId
+          let fvars := fvars.push fvar
+          process lctx fvars j b
+        else
+          let type := type.instantiateRevRange j fvars.size fvars;
+          k fvars type
+      | _ =>
+        let type := type.instantiateRevRange j fvars.size fvars;
+        if reducing && fvarsSizeLtMaxFVars fvars maxFVars? then
+          let newType ← whnf type
+          if newType.isForall then
+            process lctx fvars fvars.size newType
+          else
+            k fvars type
+        else
+          k fvars type
+    process (← getLCtx) #[] 0 type
+
+private partial def forallTelescopeReducingAux (type : Expr) (maxFVars? : Option Nat) (k : Array Expr → Expr → RecM α) (cleanupAnnotations : Bool) : RecM α := do
+   match maxFVars? with
+   | some 0 => k #[] type
+   | _ => do
+     let newType ← whnf type
+     if newType.isForall then
+       forallTelescopeReducingAuxAux true maxFVars? newType k cleanupAnnotations
+     else
+       k #[] type
+
+def forallBoundedTelescope (type : Expr) (maxFVars? : Option Nat) (k : Array Expr → Expr → RecM α) (cleanupAnnotations := false) : RecM α :=
+  forallTelescopeReducingAux type maxFVars? k cleanupAnnotations
+
+def mkLambdaFVars (xs : Array Expr) (e : Expr) (usedOnly : Bool := false) (usedLetOnly : Bool := true) (etaReduce : Bool := false) (binderInfoForMVars := BinderInfo.implicit) : RecM Expr :=
+  if xs.isEmpty then return e else liftMkBindingM <| MetavarContext.mkLambda xs e usedOnly usedLetOnly etaReduce binderInfoForMVars
+
+
+
+unsafe inductive Val
+  -- Neutral terms that cannot (or don't expect to, e.g. types) evaluate
+  -- include an environment (is that correct?) and list of arguments
+  | neutral : Expr → List Val → Array Val → Val
+  -- An expression (with environment) we may want to evaluate later
+  -- If we do, we remember the result in the IORef.
+  | thunk : Expr → List Val → (IO.Ref (Option Val)) → Val
+  -- Evaluated, partially applied closure
+  -- We store the type for readback. It's a `Val`, but will always
+  -- be `.neutral`, it seems, since we don't evaluate them anyways.
+  | closure : (arity : Nat) → (type : Val) → (pargs : Array Val) → (Array Val → RecM Val) → Val
+  -- Evaluated, fully applied constructor
+  | con : Name → List Level → (params fields : Array Val)  → Val
+  -- Literal
+  | lit : Literal → Val
+
+unsafe def Val.toString : Val → String
+  | .neutral e ρ as => s!"{e} {ρ.map toString} {as.map toString}"
+  | .thunk e ρ _ => s!"(t) {e}{ρ.map toString}"
+  | .closure n t as _f => s!"(λ^{n} … : {toString t}) {as.map toString}"
+  | .con cn _ ps fs => s!"{cn} {(ps ++ fs).map toString}"
+  | .lit l => (repr l).pretty
+
+unsafe def mkClosure (arity : Nat) (t : Expr) (ρ : List Val) (f : Array Val → RecM Val) : RecM Val := do
+  if arity = 0 then
+    f #[]
+  else
+    return .closure arity (.neutral t ρ #[]) #[] f
+
+unsafe instance : ToString Val where toString := Val.toString
+
+unsafe instance : Inhabited Val where
+  default := .lit (.natVal 42)
+
+unsafe def mkThunk (e : Expr) (ρ : List Val) : RecM Val := do
+  -- Avoid creating thunks for cheap things. (TODO: Deduplicate)
+  match e with
+  | .bvar n =>
+    assert! n < ρ.length
+    return ρ[n]!
+  | .lit l => return .lit l
+  | .forallE .. => return .neutral e ρ #[]
+  | .sort .. => return .neutral e ρ #[]
+  | _ =>
+    let r ← IO.mkRef .none
+    let ρ := ρ.take (e.looseBVarRange)
+    return .thunk e ρ r
+
+def getLambdaBodyN (n : Nat) (e : Expr) : Expr := match n with
+  | 0 => e
+  | n+1 => getLambdaBodyN n e.bindingBody!
+
+def getLambdaTypeN : Nat → Expr → Expr
+  | 0, _ => .sort 42 -- dummy
+  | n+1, .lam i t b bi => .forallE i t (getLambdaTypeN n b) bi
+  | _, _ => panic! "getLambdaTypeN: Not enough lambdas"
+
+unsafe def Val.ofNat (n : Nat) : Val := .lit (.natVal n)
+
+unsafe def Val.ofBool : Bool → Val
+  | true => .con ``Bool.true [] #[] #[]
+  | false => .con ``Bool.false [] #[] #[]
+
+private unsafe def primNatFuns : NameMap ((a1 a2 : Nat) → Val) :=
+  .fromArray (cmp := _) #[
+    (``Nat.add, fun a1 a2 => .ofNat <| Nat.add a1 a2),
+    (``Nat.sub, fun a1 a2 => .ofNat <| Nat.sub a1 a2),
+    (``Nat.mul, fun a1 a2 => .ofNat <| Nat.mul a1 a2),
+    (``Nat.div, fun a1 a2 => .ofNat <| Nat.div a1 a2),
+    (``Nat.mod, fun a1 a2 => .ofNat <| Nat.mod a1 a2),
+    (``Nat.pow, fun a1 a2 => .ofNat <| Nat.pow a1 a2), -- todo: guard against large exponents
+    (``Nat.gcd, fun a1 a2 => .ofNat <| Nat.gcd a1 a2),
+    (``Nat.beq, fun a1 a2 => .ofBool <| Nat.beq a1 a2),
+    (``Nat.ble, fun a1 a2 => .ofBool <| Nat.ble a1 a2),
+    (``Nat.land, fun a1 a2 => .ofNat <| Nat.land a1 a2),
+    (``Nat.lor , fun a1 a2 => .ofNat <| Nat.lor a1 a2),
+    (``Nat.xor , fun a1 a2 => .ofNat <| Nat.xor a1 a2),
+    (``Nat.shiftLeft , fun a1 a2 => .ofNat <| Nat.shiftLeft a1 a2),
+    (``Nat.shiftRight, fun a1 a2 => .ofNat <| Nat.shiftRight a1 a2)]
+
+unsafe def app (v₁ v₂ : Val) : RecM Val := do
+  match v₁ with
+  | .neutral e₁' ρ as =>
+    return .neutral e₁' ρ (as.push v₂)
+  | .closure arity t as f => do
+    let as' := as.push v₂
+    if as'.size < arity then
+      return .closure arity t as' f
+    else
+      assert! as'.size = arity
+      f as'
+  | .thunk _ _ _ =>
+    panic! "force returned thunk"
+  | v => throw <| .other s!"Cannot apply value {v}"
+
+mutual
+-- Using a while loop to make sure it's tail recursive
+unsafe def force  (v : Val) : RecM Val := do
+  let mut v := v
+  let mut rs := #[]
+  while true do
+    if let .thunk e ρ r := v then
+      match ← r.get with
+      | .some v' => v := v'
+      | .none =>
+        rs := rs.push r
+        v ← eval e ρ
+    else
+      break
+  rs.forM (·.set v)
+  return v
+
+unsafe def forceNat (acc : Nat) (v : Val) : RecM (Option Nat) := do
+  match (← force v) with
+  | .lit (.natVal n) => return (n+acc)
+  | .con `Nat.succ _ _ #[v] => forceNat (acc + 1) v
+  | .con `Nat.zero _ _ _ => return acc
+  | _ => return none
+
+unsafe def eval (e : Expr) (ρ : List Val) :
+    RecM Val := do
+  match e with
+  | .bvar n => return ρ[n]!
+  | .lam .. =>
+    let arity := e.getNumHeadLambdas
+    let t := getLambdaTypeN arity e
+    mkClosure arity t ρ fun vs => do
+      let e := getLambdaBodyN arity e
+      -- eval genv lctx e (vs.toListRev ++ ρ)
+      mkThunk e (vs.toListRev ++ ρ)
+  | .app e₁ e₂ =>
+      app (← force (← eval e₁ ρ)) (← mkThunk e₂ ρ)
+  | .proj _ idx e =>
+      match (← force (← eval e ρ)) with
+      | .con _cn _us _ps fs =>
+        if let some v := fs[idx]? then
+          return v
+        else
+          throw <| .other "Projection out of range"
+      | v => throw <| .other s!"Cannot project value {v}"
+  | .const n us =>
+      let some ci := (← getEnv).find? n | throw <| .other s!"Did not find {n}"
+      if let some fn := primNatFuns.find? n then
+        -- IO.eprint s!"Unfolding {n} (primitive)\n"
+        mkClosure 2 ci.type ρ fun vs => do
+          assert! vs.size = 2
+          let v1 ← forceNat 0 vs[0]!
+          let v2 ← forceNat 0 vs[1]!
+          match v1, v2 with
+          | .some n₁, .some n₂ =>
+            return fn n₁ n₂
+          | _, _ =>
+            return .neutral e [] vs
+      else match ci with
+      | .defnInfo ci | .thmInfo ci =>
+        -- IO.eprintln s!"Unfolding {ci.name}"
+        let t := ci.type.instantiateLevelParams ci.levelParams us
+        let e := ci.value.instantiateLevelParams ci.levelParams us
+        let arity := e.getNumHeadLambdas
+        mkClosure arity t [] fun vs => do
+          let e := getLambdaBodyN arity e
+          eval e vs.toListRev
+      | .ctorInfo ci =>
+        let t := ci.type.instantiateLevelParams ci.levelParams us
+        let arity := ci.numParams + ci.numFields
+        mkClosure arity t [] fun vs => do
+          return .con ci.name us vs[:ci.numParams] vs[ci.numParams:]
+      | .recInfo ci =>
+        let t := ci.type.instantiateLevelParams ci.levelParams us
+        let arity :=ci.numParams + ci.numMotives + ci.numMinors + ci.numIndices + 1
+        mkClosure arity t [] fun vs => do
+          let rargs : Array _ := vs[:ci.numParams + ci.numMotives + ci.numMinors]
+          match (← force vs.back!) with
+          | .con cn _us _as fs =>
+            let some rule := ci.rules.find? (·.ctor == cn)
+              | throw <| .other s!"Unexpected constructor {cn} for recursor {ci.name}"
+            if ! rule.nfields = fs.size then
+              throw <| .other s!"Arity mismatch: {cn} has {fs.size} but {ci.name} expects {rule.nfields} fields"
+            else
+              let rhs := rule.rhs.instantiateLevelParams ci.levelParams us
+              let rhs := getLambdaBodyN (rargs.size + fs.size) rhs
+              -- logInfo m!"Applying {ci.name} with args {rargs} and {fs}\n"
+              -- IO.eprint s!"Applying {ci.name} with args {rargs} and {fs}\n"
+              eval rhs ((rargs ++ fs).toListRev ++ ρ)
+          | .lit (.natVal n) =>
+            unless ci.name = ``Nat.rec do
+              throw <| .other s!"Cannot apply recursor {ci.name} to literal {n}"
+            if n = 0 then
+              let rhs := ci.rules[0]!.rhs
+              let rhs := rhs.instantiateLevelParams ci.levelParams us
+              let rhs := getLambdaBodyN rargs.size rhs
+              eval rhs (rargs.toListRev ++ ρ)
+            else
+              let rhs := ci.rules[1]!.rhs
+              let rhs := rhs.instantiateLevelParams ci.levelParams us
+              let rhs := getLambdaBodyN (rargs.size + 1) rhs
+              eval rhs ((.lit (.natVal (n-1))) :: rargs.toListRev ++ ρ)
+
+          | v => throw <| .other s!"Cannot apply recursor {ci.name} to {v}"
+      | .quotInfo ci =>
+        match ci.kind with
+        | .type => return .neutral e [] #[]
+        | .ctor =>
+          let t := ci.type.instantiateLevelParams ci.levelParams us
+          let arity := 3
+          mkClosure arity t [] fun vs => do
+            return .con ci.name us vs[:2] vs[2:]
+        | .lift | .ind =>
+          let t := ci.type.instantiateLevelParams ci.levelParams us
+          let arity := if ci.kind matches .lift then 6 else 5
+          mkClosure arity t [] fun vs => do
+            match (← force vs.back!) with
+            | .con cn _us _as fs =>
+              assert! cn = ``Quot.mk
+              assert! fs.size = 1
+              app (← force vs[3]!) fs[0]!
+            | v => throw <| .other s!"Cannot apply quot recursor {ci.name} to {v}"
+      | _ =>
+        -- This should work, but in Mathlib.GroupTheory.SpecificGroups.Alternating a proof
+        -- either takes too long or goes into a loop. For now, as we are interested
+        -- in fully reducing proofs, just throw
+        return .neutral e [] #[]
+        -- throw <| .other s!"Unevaluatable constant {ci.name}"
+  | .letE n t rhs b _ =>
+    eval (.app (.lam n t b .default) rhs) ρ
+  | .lit l => return .lit l
+  | .forallE .. => return .neutral e ρ #[]
+  | .sort .. => return .neutral e ρ #[]
+  | .mdata _ e => eval e ρ
+  | _ => throw <| .other s!"eval: unimplemented: {e}"
+end
+
+-- Highly inefficient
+-- Should cache results and read back only those elements of the environment that are actually
+-- used.
+-- But as long as we only test reading back small examples and `Nat`s otherwise, fine
+unsafe def readback : Val → RecM Expr
+  | .neutral e ρ as => do
+    return mkAppN (e.instantiate (← ρ.mapM readback).toArray) (← as.mapM readback)
+  | .thunk e ρ t => do match (← t.get) with
+    | .some v => readback v
+    | .none => return e.instantiate (← ρ.mapM readback).toArray
+  | .lit l => return .lit l
+  | .con cn us ps fs =>
+    return mkAppN (.const cn us) (← (ps ++ fs).mapM readback)
+  | .closure arity tv as f => do
+    let t ← readback tv
+    let f ← forallBoundedTelescope t arity fun xs _ => do
+      let rv ← f (xs.map (Val.neutral · [] #[]))
+      let re ← readback rv
+      mkLambdaFVars xs re
+    return f.beta (← as.mapM readback)
+
+unsafe def lazyNbeImpl (e : Expr) : RecM Expr := do
+  let v ← eval e []
+  -- logInfo m!"Evaled, not forced: {v}"
+  let v ← force v
+  -- IO.println f!"Forced: {v}"
+  readback v
+
+@[implemented_by lazyNbeImpl]
+opaque lazyNbE (e : Expr) : RecM Expr
+
+end LazyNbE
+
 open Inner
 
-def Methods.withFuel : Nat → Methods
+def Methods.withFuelDefault : Nat → Methods
   | 0 =>
     { isDefEqCore := fun _ _ => throw .deepRecursion
       whnfCore := fun _ _ _ => throw .deepRecursion
       whnf := fun _ => throw .deepRecursion
       inferType := fun _ _ => throw .deepRecursion }
   | n + 1 =>
-    { isDefEqCore := fun t s => isDefEqCore' t s (withFuel n)
-      whnfCore := fun e r p => whnfCore' e r p (withFuel n)
-      whnf := fun e => whnf' e (withFuel n)
-      inferType := fun e i => inferType' e i (withFuel n) }
+    { isDefEqCore := fun t s => isDefEqCore' t s (withFuelDefault n)
+      whnfCore := fun e r p => whnfCore' e r p (withFuelDefault n)
+      whnf := fun e => whnf' e (withFuelDefault n)
+      inferType := fun e i => inferType' e i (withFuelDefault n) }
 
-def RecM.run (x : RecM α) : M α := x (Methods.withFuel 1000)
+def Methods.withFuelLazyNbE : Nat → Methods
+  | 0 =>
+    { isDefEqCore := fun _ _ => throw .deepRecursion
+      whnfCore := fun _ _ _ => throw .deepRecursion
+      whnf := fun _ => throw .deepRecursion
+      inferType := fun _ _ => throw .deepRecursion }
+  | n + 1 =>
+    { isDefEqCore := fun t s => isDefEqCore' t s (withFuelLazyNbE n)
+      whnfCore := fun e _ _ => LazyNbE.lazyNbE e (withFuelLazyNbE n) --lazyNbE does not handle tags for cheapRec and cheapProj
+      whnf := fun e => LazyNbE.lazyNbE e (withFuelLazyNbE n)
+      inferType := fun e i => inferType' e i (withFuelLazyNbE n) }
 
+class MPack where
+  run {α}: RecM α → M α
+
+def MPack.default : MPack where
+  run x :=  x (Methods.withFuelDefault 1000)
+
+def MPack.lazyNbE : MPack where
+  run x := x (Methods.withFuelLazyNbE 1000)
+
+inductive Pack where
+  | default | lazyNbE
+
+def Pack.get : Pack → MPack
+  | default => .default
+  | lazyNbE => .lazyNbE
+
+variable [pack : MPack]
 def check (e : Expr) (lps : List Name) : M Expr :=
-  withReader ({ · with lparams := lps }) (inferType e (inferOnly := false)).run
+  withReader ({ · with lparams := lps }) (pack.run (inferType e (inferOnly := false)))
 
-def whnf (e : Expr) : M Expr := (Inner.whnf e).run
+def whnf (e : Expr) : M Expr := pack.run (Inner.whnf e)
 
-def inferType (e : Expr) : M Expr := (Inner.inferType e).run
+def inferType (e : Expr) : M Expr := pack.run (Inner.inferType e)
 
-def isDefEq (t s : Expr) : M Bool := (Inner.isDefEq t s).run
+def isDefEq (t s : Expr) : M Bool := pack.run (Inner.isDefEq t s)
 
-def isProp (t : Expr) : M Bool := (Inner.isProp t).run
+def isProp (t : Expr) : M Bool := pack.run (Inner.isProp t)
 
-def ensureSort (t : Expr) (s := t) : M Expr := (ensureSortCore t s).run
+def ensureSort (t : Expr) (s := t) : M Expr := pack.run (ensureSortCore t s)
 
-def ensureForall (t : Expr) (s := t) : M Expr := (ensureForallCore t s).run
+def ensureForall (t : Expr) (s := t) : M Expr := pack.run (ensureForallCore t s)
 
 def ensureType (e : Expr) : M Expr := do ensureSort (← inferType e) e
 
-def etaExpand (e : Expr) : M Expr :=
+def etaExpand  (e : Expr) : M Expr :=
   let rec loop fvars
   | .lam name dom body bi => do
     let d := dom.instantiateRev fvars
