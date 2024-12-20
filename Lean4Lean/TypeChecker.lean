@@ -377,12 +377,19 @@ def unfoldDefinition (env : Environment) (e : Expr) : Option Expr := do
   else
     unfoldDefinitionCore env e
 
-def reduceNative (_env : Environment) (e : Expr) : Except KernelException (Option Expr) := do
+def reduceNative (env : Environment) (e : Expr) : RecM (Option Expr) := do
   let .app f (.const c _) := e | return none
   if f == .const ``reduceBool [] then
-    throw <| .other s!"lean4lean does not support 'reduceBool {c}' reduction"
+    dbg_trace "reduce_bool {c} : {env.contains c} : {Lean.IR.findEnvDecl env c}"
+    match unsafe Lean.Environment.evalConst  Bool env default c with
+     | .error s => throw <| .other s!"Failed to reduce `ofReduceBool:\n {s}"
+     | .ok true => return Expr.const ``true []
+     | .ok false =>return Expr.const ``false []
   else if f == .const ``reduceNat [] then
-    throw <| .other s!"lean4lean does not support 'reduceNat {c}' reduction"
+    dbg_trace "reduce_nat {c} : {env.contains c}"
+    match unsafe Lean.Environment.evalConst  Nat env default c with
+     | .error s => throw <| .other s!"Failed to reduce `ofReduceNat:\n {s}"
+     | .ok n => return mkNatLit n
   return none
 
 def rawNatLitExt? (e : Expr) : Option Nat := if e == .natZero then some 0 else e.rawNatLit?

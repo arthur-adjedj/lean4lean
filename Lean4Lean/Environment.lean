@@ -46,7 +46,8 @@ def addDefinition (env : Environment) (v : DefinitionVal) (check := true) :
         let valType ← TypeChecker.check v.value v.levelParams
         if !(← isDefEq valType v.type) then
           throw <| .declTypeMismatch env (.defnDecl v) valType
-    return add env (.defnInfo v)
+    let env := add env (.defnInfo v)
+    compileDecl env default (.defnDecl v)
 
 def addTheorem (env : Environment) (v : TheoremVal) (check := true) :
     Except KernelException Environment := do
